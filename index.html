@@ -309,6 +309,29 @@ main {
   color: var(--text-main);
   font-size: 11px;
 }
+.acta-deploy-panel {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--success);
+  background: rgba(16, 185, 129, 0.08);
+}
+.acta-deploy-panel.hidden { display: none; }
+.acta-deploy-panel h4 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: var(--success);
+}
+.acta-deploy-links {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.acta-deploy-links a {
+  color: var(--primary);
+  font-size: 12px;
+  word-break: break-all;
+}
 .validate-manual-row {
   display: flex;
   gap: 8px;
@@ -982,7 +1005,7 @@ canvas.signature-pad {
           <input type="text" id="inputManualSerial" placeholder="Dispare aquí — una serie por línea (Enter)" class="code-mono" autocapitalize="characters" autocomplete="off" autocorrect="off" spellcheck="false" enterkeyhint="done" inputmode="text">
           <button type="button" class="btn btn-primary" id="btnValidateManual">Recibir</button>
         </div>
-        <p class="pistol-hint">Dispare en este cuadro: valida con <strong>Enter</strong> o <strong>sola</strong> (~0,3 s). Guiones tipo <code>PF – 3AG4Y9</code> se normalizan. La cámara no se abre.</p>
+        <p class="pistol-hint">Pistola USB: dispare aquí (valida sola al terminar el disparo). Manual: escriba la serie y pulse <strong>Recibir</strong> o <strong>Enter</strong>. Guiones tipo <code>PF – 3AG4Y9</code> se normalizan.</p>
       </div>
       <p style="font-size:11px;color:var(--text-muted);margin:0 0 10px;">
         Sin pistola: <strong>QR</strong> / <strong>Barras</strong> con marco y raya láser; <strong>Cámara OCR</strong> encuadra la etiqueta y captura. Series ya recibidas se bloquean entre teléfonos.
@@ -996,7 +1019,7 @@ canvas.signature-pad {
         <button type="button" class="capture-tile" id="btnLiveBarcodeScan">
           <span class="cap-icon">|||</span>
           Barras (cámara)
-          <span class="cap-sub">Cierra al detectar</span>
+          <span class="cap-sub">Marco rojo · cierra al leer</span>
         </button>
         <button type="button" class="capture-tile primary" id="btnOcrLabelScan">
           <span class="cap-icon">📷</span>
@@ -1070,10 +1093,14 @@ canvas.signature-pad {
           <textarea id="receptionNotes" rows="3" placeholder="Observaciones de entrega física, faltantes de cargadores, estado de embalaje..."></textarea>
         </div>
       </div>
-      <div style="margin-top:16px;display:flex;gap:10px;">
-        <button class="btn btn-primary" id="btnGenerateActaPdf" style="flex:1;">📄 Descargar Acta Oficial (PDF)</button>
-        <button class="btn btn-secondary" id="btnShareActa">📤 Compartir Acta</button>
+      <div style="margin-top:16px;display:flex;gap:10px;flex-wrap:wrap;">
+        <button class="btn btn-primary" id="btnDeliverSignedActa" style="flex:1;min-width:240px;">✅ Entregar acta firmada (PDF + Excel)</button>
+        <button class="btn btn-secondary" id="btnShareActa">📤 Compartir acta firmada</button>
       </div>
+      <p style="font-size:11px;color:var(--text-muted);margin:8px 0 0;">
+        Requiere <strong>ambas firmas</strong> en pantalla, representante y técnico. Genera PDF + Excel (plantilla ORD), descarga local y despliega enlaces en nube si Supabase está conectado.
+      </p>
+      <div id="actaDeployPanel" class="acta-deploy-panel hidden" aria-live="polite"></div>
       <div class="phase-actions">
         <span style="font-size:12px;color:var(--text-muted);margin-right:auto;">Al cerrar recepción, la orden pasa a Borrado y diagnóstico.</span>
         <button type="button" class="btn btn-primary" id="btnCompleteReception" disabled>Completar recepción →</button>
@@ -1485,7 +1512,7 @@ const Domain = (() => {
       const n = this.fixLenovoPfTypo(this.normalize(s));
       if (this.isDellServiceTagNorm(n)) return true;
       if (/^PF[A-Z0-9]{5,12}$/.test(n)) return true;
-      if (n.length >= 6 && n.length <= 20 && /[0-9]/.test(n) && /[A-Z]/.test(n)) return true;
+      if (n.length >= 7 && n.length <= 20 && /[0-9]/.test(n) && /[A-Z]/.test(n)) return true;
       return this.extractAllScanTokens(s).length > 0;
     }
 
@@ -1623,9 +1650,12 @@ const Domain = (() => {
         const picked = src
           .map(t => this.sanitizePistolLine(t))
           .filter(t => t && this.isLikelyBarcodeRead(t, orderItems));
-        if (!picked.length) return [];
-        picked.sort((a, b) => this.normalize(b).length - this.normalize(a).length);
-        return this.expandCandidates([picked[0]]);
+        if (picked.length) {
+          picked.sort((a, b) => this.normalize(b).length - this.normalize(a).length);
+          return this.expandCandidates([picked[0]]);
+        }
+        const fallback = src.flatMap(t => this.extractAllScanTokens(String(t || ''))).filter(Boolean);
+        return fallback.length ? this.expandCandidates(fallback) : [];
       }
 
       return this.expandCandidates(
@@ -2194,6 +2224,47 @@ function getItadLabelOcrWorker() {
     })().catch(() => null);
   }
   return itadLabelOcrWorkerPromise;
+}
+
+/** Hints ZXing por modo (Code128 en vivo vs QR) */
+function buildZxingDecodeHints(mode = 'any') {
+  const hints = new Map();
+  if (!window.ZXing) return hints;
+  hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+  const F = ZXing.BarcodeFormat;
+  if (!F) return hints;
+  if (mode === 'barcode') {
+    hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
+      F.CODE_128,
+      F.CODE_39,
+      F.CODE_93,
+      F.ITF,
+      F.CODABAR
+    ]);
+  } else if (mode === 'qr') {
+    hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
+      F.QR_CODE,
+      F.DATA_MATRIX,
+      F.AZTEC,
+      F.PDF_417
+    ]);
+  }
+  return hints;
+}
+
+/** Escala el recorte antes de BarcodeDetector/ZXing (mejor Code128 en móvil) */
+function upscaleCanvasForDecode(canvas, maxEdge = 1800) {
+  if (!canvas?.width || !canvas?.height) return canvas;
+  const edge = Math.max(canvas.width, canvas.height);
+  if (edge >= maxEdge) return canvas;
+  const scale = maxEdge / edge;
+  const out = document.createElement('canvas');
+  out.width = Math.round(canvas.width * scale);
+  out.height = Math.round(canvas.height * scale);
+  const ctx = out.getContext('2d');
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(canvas, 0, 0, out.width, out.height);
+  return out;
 }
 
 /** Evita data: URLs gigantes al decodificar con ZXing */
@@ -2918,21 +2989,31 @@ class SupabaseStorageAdapter {
   }
 
   async uploadPdf(fileBuffer, filename) {
+    return this.uploadBinary(fileBuffer, filename, 'application/pdf', 'certificates');
+  }
+
+  /** Actas firmadas (PDF + Excel) — carpeta actas/{año}/{orden}/ */
+  async uploadActa(blobOrBuffer, filename, contentType) {
+    const ord = (AppState.orderMetadata.clientProjectOrder || AppState.orderMetadata.serviceOrderId || 'orden')
+      .replace(/[^\w-]+/g, '-');
+    const sub = `actas/${new Date().getFullYear()}/${ord}`;
+    return this.uploadBinary(blobOrBuffer, filename, contentType, sub);
+  }
+
+  async uploadBinary(fileBuffer, filename, contentType, folderPrefix) {
+    const buf = fileBuffer instanceof Blob ? await fileBuffer.arrayBuffer() : fileBuffer;
     if (!this.client) {
       return {
         storagePath: 'local://' + filename,
-        publicUrl: URL.createObjectURL(new Blob([fileBuffer], { type: 'application/pdf' })),
+        publicUrl: URL.createObjectURL(new Blob([buf], { type: contentType })),
         isLocalFallback: true
       };
     }
-
-    const path = `certificates/${filename}`;
-    const { data, error } = await this.client.storage
+    const path = `${folderPrefix}/${filename}`;
+    const { error } = await this.client.storage
       .from(this.bucketPdfs)
-      .upload(path, fileBuffer, { contentType: 'application/pdf', upsert: true });
-
+      .upload(path, buf, { contentType, upsert: true });
     if (error) throw error;
-
     const { data: urlData } = this.client.storage.from(this.bucketPdfs).getPublicUrl(path);
     return {
       storagePath: path,
@@ -3285,6 +3366,11 @@ const OrderStore = {
           activeModule: 'tab-reception',
           orderClosed: order.status === 'CLOSED'
         };
+    const acta = order.orderMetadata?.actaDeploy || order.workflow?.actaDeploy;
+    if (acta) AppState.workflow.actaDeploy = acta;
+    queueMicrotask(() => {
+      if (typeof UI !== 'undefined' && UI.renderActaDeployPanel) UI.renderActaDeployPanel();
+    });
   },
 
   saveAll(opts = {}) {
@@ -4454,7 +4540,8 @@ function parseOrderSpreadsheet(arrayBuffer) {
         itemNo: Number.isFinite(itemNo) ? itemNo : newItems.length + 1,
         serial,
         make: cellAt(r, 4) || 'DELL INC.',
-        model: cellAt(r, 5) || 'Latitude 5420'
+        model: cellAt(r, 5) || 'Latitude 5420',
+        category: cellAt(r, 3) || 'Laptop'
       }));
     } catch {
       skippedFooter++;
@@ -4525,6 +4612,8 @@ const UI = {
   liveScanFrameTimer: null,
   pistolLastDedupe: { serial: '', at: 0 },
   pistolAutoTimer: null,
+  pistolScannerBurst: false,
+  pistolLastKeyAt: 0,
   labelOcrBusy: false,
   pendingReceiveConfirm: null,
 
@@ -4579,6 +4668,7 @@ const UI = {
         OrderStore.pullFromCloud({ silent: true }).then(() => UI.renderPresenceBar());
       }
       UI.renderReceptionOrderSelector();
+      UI.renderActaDeployPanel();
       UI.focusPistolInput();
     }
     if (moduleId === 'tab-reconciliation') UI.renderAuditPreview();
@@ -5395,8 +5485,7 @@ const UI = {
     const handlePistol = () => {
       const input = document.getElementById('inputManualSerial');
       const raw = input.value;
-      input.value = '';
-      UI.focusPistolInput();
+      if (!String(raw || '').trim()) return;
       const tokens = Domain.SerialMatcher.extractAllScanTokens(raw);
       if (!tokens.length) return;
       if (!AppState.items.length) {
@@ -5407,27 +5496,37 @@ const UI = {
         Domain.SerialMatcher.normalize(tokens[0] || '')
       );
       if (probeNorm && UI.isPistolDuplicate(probeNorm)) return;
+      input.value = '';
+      UI.pistolScannerBurst = false;
+      UI.focusPistolInput();
       void UI.processValidationTexts(tokens, 'pistol_scan');
     };
 
     document.getElementById('btnValidateManual').onclick = () => { handlePistol(); };
     const pistolInp = document.getElementById('inputManualSerial');
-    const pistolTriggerKeys = e => {
-      if (e.key === 'Enter' || e.key === 'Tab') {
+    pistolInp.addEventListener('keydown', e => {
+      const now = Date.now();
+      const gap = UI.pistolLastKeyAt ? now - UI.pistolLastKeyAt : 999;
+      if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        if (gap > 0 && gap < 55) UI.pistolScannerBurst = true;
+        else if (gap > 200) UI.pistolScannerBurst = false;
+      }
+      UI.pistolLastKeyAt = now;
+      if (e.key === 'Enter') {
         e.preventDefault();
         handlePistol();
       }
-    };
-    pistolInp.addEventListener('keydown', pistolTriggerKeys);
+    });
     pistolInp.addEventListener('input', () => {
       clearTimeout(UI.pistolAutoTimer);
+      if (!UI.pistolScannerBurst) return;
       UI.pistolAutoTimer = setTimeout(() => {
         const v = pistolInp.value;
         if (!v.trim()) return;
         if (Domain.SerialMatcher.pistolScanLooksComplete(v)) {
           handlePistol();
         }
-      }, 120);
+      }, 320);
     });
   },
 
@@ -5552,14 +5651,20 @@ const UI = {
 
   async finishLiveScanAndClose(texts, via) {
     if (UI.liveScanHandled) return;
-    const good = (texts || []).filter(t =>
+    const sanitized = (texts || [])
+      .map(t => String(t || '').trim())
+      .filter(Boolean)
+      .flatMap(t => Domain.SerialMatcher.extractAllScanTokens(t));
+    const uniq = [...new Set(sanitized)];
+    const good = uniq.filter(t =>
       Domain.SerialMatcher.isLikelyBarcodeRead(t, AppState.items)
     );
-    if (!good.length) return;
+    const toProcess = good.length ? good : uniq;
+    if (!toProcess.length) return;
     UI.liveScanHandled = true;
     UI.stopLiveScanner();
     try {
-      await UI.processValidationTexts(good, via);
+      await UI.processValidationTexts(toProcess, via);
     } finally {
       UI.focusPistolInput();
     }
@@ -5607,9 +5712,9 @@ const UI = {
     clearInterval(UI.liveScanFrameTimer);
     document.getElementById('modalLiveScan').classList.remove('hidden');
     const video = document.getElementById('liveScanVideo');
-    const hints = new Map();
-    hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
-    UI.liveScanReader = new ZXing.BrowserMultiFormatReader(hints);
+    UI.liveScanReader = new ZXing.BrowserMultiFormatReader(
+      buildZxingDecodeHints(isBarcode ? 'barcode' : 'qr')
+    );
     const deviceId = await UI.pickRearCameraDeviceId();
     const via = isBarcode ? 'live_barcode' : 'live_qr';
     try {
@@ -5622,7 +5727,8 @@ const UI = {
           }
         }
       });
-      UI.liveScanFrameTimer = setInterval(() => UI.pollLiveScanFrame(video, via), 1400);
+      const pollMs = isBarcode ? 650 : 1400;
+      UI.liveScanFrameTimer = setInterval(() => UI.pollLiveScanFrame(video, via), pollMs);
     } catch (err) {
       UIFeedback.toast('No se pudo abrir la cámara: ' + (err.message || err), 'danger');
       UI.stopLiveScanner();
@@ -5781,7 +5887,11 @@ const UI = {
   async pollLiveScanFrame(video, via) {
     if (UI.liveScanHandled || !video?.videoWidth) return;
     const mode = via === 'live_barcode' ? 'barcode' : 'qr';
-    const texts = await UI.decodeBarcodesFromVideoElement(video, [0, 90, 180, 270], { cropToFrame: true, mode });
+    const rots = mode === 'barcode' ? [0, 180, 90, 270] : [0, 90, 180, 270];
+    let texts = await UI.decodeBarcodesFromVideoElement(video, rots, { cropToFrame: true, mode });
+    if (!texts.length && mode === 'barcode') {
+      texts = await UI.decodeBarcodesFromVideoElement(video, [0, 180], { cropToFrame: false, mode });
+    }
     if (!texts.length) return;
     UI.setLiveScanStatus('¡Código leído!');
     await UI.finishLiveScanAndClose(texts, via);
@@ -5816,20 +5926,22 @@ const UI = {
         ctx.rotate((rot * Math.PI) / 180);
         ctx.drawImage(video, -w / 2, -h / 2, w, h);
       }
+      const decodeCanvas = upscaleCanvasForDecode(canvas);
       if ('BarcodeDetector' in window) {
         try {
-          const detector = new BarcodeDetector({ formats: ['code_128', 'code_39', 'qr_code', 'data_matrix'] });
-          const detected = await detector.detect(canvas);
-          detected.forEach(d => results.add(d.rawValue));
+          const formats = mode === 'qr'
+            ? ['qr_code', 'data_matrix', 'aztec']
+            : ['code_128', 'code_39', 'itf', 'codabar', 'qr_code', 'data_matrix'];
+          const detector = new BarcodeDetector({ formats });
+          const detected = await detector.detect(decodeCanvas);
+          detected.forEach(d => { if (d.rawValue) results.add(String(d.rawValue).trim()); });
         } catch (_) { /* ignore */ }
       }
       if (!results.size && window.ZXing) {
         try {
-          const hints = new Map();
-          hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
-          const reader = new ZXing.BrowserMultiFormatReader(hints);
-          const text = await zxingDecodeFromCanvas(reader, canvas, 0.82);
-          if (text) results.add(text);
+          const reader = new ZXing.BrowserMultiFormatReader(buildZxingDecodeHints(mode));
+          const text = await zxingDecodeFromCanvas(reader, decodeCanvas, 0.92);
+          if (text) results.add(text.trim());
         } catch (_) { /* ignore */ }
       }
       if (results.size) break;
@@ -6566,8 +6678,8 @@ const UI = {
       AppState.signerXsi.dpi = e.target.value;
     };
 
-    document.getElementById('btnGenerateActaPdf').onclick = () => UI.generateActa(false);
-    document.getElementById('btnShareActa').onclick = () => UI.generateActa(true);
+    document.getElementById('btnDeliverSignedActa').onclick = () => UI.deliverSignedActa();
+    document.getElementById('btnShareActa').onclick = () => UI.deliverSignedActa({ shareOnly: true });
   },
 
   async renderPresenceBar() {
@@ -7162,78 +7274,434 @@ const UI = {
     UI.downloadBlob(new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8' }), `conciliacion-${Date.now()}.csv`);
   },
 
-  async generateActa(shareViaOs = false) {
+  getActaSigners() {
+    return {
+      clientName: document.getElementById('signerClientName').value.trim(),
+      clientDpi: document.getElementById('signerClientDpi').value.trim(),
+      xsiName: document.getElementById('signerXsiName').value.trim(),
+      xsiDpi: document.getElementById('signerXsiDpi').value.trim(),
+      notes: document.getElementById('receptionNotes').value.trim()
+    };
+  },
+
+  validateActaReady() {
     if (!AppState.items.length) {
       UIFeedback.toast('Cargue primero los activos de la orden', 'warning');
-      return;
+      return null;
     }
     const received = AppState.items.filter(i => i.status === 'RECEIVED');
     if (!received.length) {
       UIFeedback.toast('No se ha recibido ningún equipo aún en la lista', 'warning');
-      return;
+      return null;
     }
-
-    const clientName = document.getElementById('signerClientName').value.trim();
-    if (!clientName) {
+    const signers = UI.getActaSigners();
+    if (!signers.clientName) {
       UIFeedback.toast('Ingrese el nombre del representante del cliente', 'warning');
+      return null;
+    }
+    if (!signers.xsiName) {
+      UIFeedback.toast('Ingrese el nombre del técnico XSI', 'warning');
+      return null;
+    }
+    if (!AppState.signerClient.signature) {
+      UIFeedback.toast('Falta la firma del representante del cliente en pantalla', 'warning');
+      return null;
+    }
+    if (!AppState.signerXsi.signature) {
+      UIFeedback.toast('Falta la firma del técnico XSI en pantalla', 'warning');
+      return null;
+    }
+    return signers;
+  },
+
+  signaturePngBase64(dataUrl) {
+    if (!dataUrl || typeof dataUrl !== 'string') return null;
+    const m = dataUrl.match(/^data:image\/\w+;base64,(.+)$/);
+    return m ? m[1] : null;
+  },
+
+  /** Filas alineadas a plantilla ORD — Receipt of Equipment (.xlsx) */
+  buildReceiptActaRows() {
+    return [...AppState.items]
+      .sort((a, b) => (a.itemNo || 0) - (b.itemNo || 0))
+      .map((item, idx) => {
+        const received = item.status === 'RECEIVED';
+        return {
+          itemNo: item.itemNo ?? idx + 1,
+          product: item.category || 'Laptop',
+          make: item.make || '',
+          model: item.model || '',
+          serial: item.serial.raw,
+          received,
+          receivedLabel: received ? 'Sí' : 'No',
+          dataLabel: received ? 'Y' : 'N',
+          notes: [item.cosmeticNote, received ? item.receivedByName : ''].filter(Boolean).join(' · ')
+        };
+      });
+  },
+
+  actaBaseFilename(ext) {
+    const ord = AppState.orderMetadata.clientProjectOrder || '';
+    const slug = ord ? ord.replace(/[^\w-]+/g, '-') : `recepcion-${Date.now()}`;
+    return `Receipt-${slug}.${ext}`;
+  },
+
+  renderReceiptActaPdf(doc, signers) {
+    const meta = AppState.orderMetadata;
+    const rows = UI.buildReceiptActaRows();
+    const receivedCount = rows.filter(r => r.received).length;
+    const pageW = doc.internal.pageSize.getWidth();
+    const pageH = doc.internal.pageSize.getHeight();
+    const margin = 10;
+    let y = 12;
+
+    doc.setFontSize(12);
+    doc.setFont(undefined, 'bold');
+    doc.text('Receipt of Equipment Containing Data', pageW / 2, y, { align: 'center' });
+    y += 5;
+    doc.setFontSize(8);
+    doc.setFont(undefined, 'normal');
+    doc.text('ACTA DE RECEPCIÓN Y CUSTODIA — ITAD CORE · XS INTERNATIONAL', pageW / 2, y, { align: 'center' });
+    y += 8;
+
+    const label = (txt, x, yy, bold) => {
+      doc.setFont(undefined, bold ? 'bold' : 'normal');
+      doc.text(txt, x, yy);
+    };
+    const val = (txt, x, yy, maxW) => {
+      doc.setFont(undefined, 'normal');
+      const lines = doc.splitTextToSize(String(txt || '—'), maxW);
+      doc.text(lines, x, yy);
+      return lines.length * 4;
+    };
+
+    label('Customer:', margin, y, true);
+    val(meta.customer, margin + 22, y, 95);
+    label('Pickup Date:', pageW / 2 + 4, y, true);
+    val(meta.pickupDate, pageW / 2 + 28, y, 45);
+    y += 6;
+
+    label('Company Name:', margin, y, true);
+    val('XS International', margin + 28, y, 90);
+    label('Project ID:', pageW / 2 + 4, y, true);
+    val(meta.poReference || meta.project, pageW / 2 + 28, y, 55);
+    y += 6;
+
+    label('Collection Address:', margin, y, true);
+    const addrH = val(meta.address, margin + 38, y, pageW - margin - 48);
+    y += Math.max(addrH, 4) + 2;
+
+    if (meta.clientProjectOrder) {
+      label('Project Order:', margin, y, true);
+      val(meta.clientProjectOrder, margin + 28, y, 80);
+      y += 6;
+    }
+
+    doc.setFontSize(7);
+    const cols = {
+      item: margin,
+      product: margin + 8,
+      make: margin + 26,
+      model: margin + 48,
+      serial: margin + 82,
+      rec: margin + 112,
+      data: margin + 128,
+      notes: margin + 138
+    };
+    const tableMaxY = pageH - 42;
+
+    const drawHead = (yy) => {
+      doc.setFillColor(235, 235, 235);
+      doc.rect(margin, yy - 3.5, pageW - margin * 2, 6, 'F');
+      doc.setFont(undefined, 'bold');
+      doc.text('Item', cols.item, yy);
+      doc.text('Product', cols.product, yy);
+      doc.text('Make', cols.make, yy);
+      doc.text('Model', cols.model, yy);
+      doc.text('Serial Number', cols.serial, yy);
+      doc.text('Recibido (Sí/No)', cols.rec, yy);
+      doc.text('Datos (Y/N)', cols.data, yy);
+      doc.text('Notes', cols.notes, yy);
+      doc.setFont(undefined, 'normal');
+      return yy + 4.5;
+    };
+
+    y = drawHead(y);
+    rows.forEach(r => {
+      if (y > tableMaxY) {
+        doc.addPage();
+        y = 14;
+        y = drawHead(y);
+      }
+      doc.text(String(r.itemNo), cols.item, y);
+      doc.text(r.product.slice(0, 10), cols.product, y);
+      doc.text(r.make.slice(0, 16), cols.make, y);
+      doc.text(r.model.slice(0, 20), cols.model, y);
+      doc.text(r.serial, cols.serial, y);
+      if (r.received) doc.setTextColor(0, 110, 0);
+      else doc.setTextColor(170, 0, 0);
+      doc.text(r.receivedLabel, cols.rec, y);
+      doc.text(r.dataLabel, cols.data, y);
+      doc.setTextColor(0, 0, 0);
+      doc.text(r.notes.slice(0, 36), cols.notes, y);
+      y += 4;
+    });
+
+    y += 3;
+    doc.setFontSize(9);
+    doc.setFont(undefined, 'bold');
+    doc.text(`TOTAL ITEMS: ${rows.length}`, margin, y);
+    doc.setFont(undefined, 'normal');
+    doc.text(
+      `Recibidos: ${receivedCount} (Sí) · Pendientes / no recibidos: ${rows.length - receivedCount} (No)`,
+      margin + 38,
+      y
+    );
+    y += 6;
+
+    if (signers.notes) {
+      doc.setFontSize(8);
+      const obs = doc.splitTextToSize(`Observaciones: ${signers.notes}`, pageW - margin * 2);
+      doc.text(obs, margin, y);
+      y += obs.length * 4 + 2;
+    }
+
+    if (y > pageH - 50) {
+      doc.addPage();
+      y = 14;
+    }
+    const signBase = pageH - 38;
+    if (AppState.signerXsi.signature) {
+      doc.addImage(AppState.signerXsi.signature, 'PNG', margin, signBase - 22, 65, 20);
+    }
+    if (AppState.signerClient.signature) {
+      doc.addImage(AppState.signerClient.signature, 'PNG', pageW / 2 + 8, signBase - 22, 65, 20);
+    }
+    doc.line(margin, signBase, margin + 75, signBase);
+    doc.line(pageW / 2 + 8, signBase, pageW / 2 + 83, signBase);
+    doc.setFontSize(8);
+    doc.text('XSi Representative Signature', margin, signBase + 4);
+    doc.text('Customer Signature', pageW / 2 + 8, signBase + 4);
+    doc.setFontSize(7);
+    doc.text(`Técnico: ${signers.xsiName || '—'} · DPI: ${signers.xsiDpi || '—'}`, margin, signBase + 9);
+    doc.text(`Representante: ${signers.clientName} · DPI: ${signers.clientDpi || '—'}`, pageW / 2 + 8, signBase + 9);
+    const today = new Date().toLocaleDateString('es-GT');
+    doc.text(today, margin, signBase + 14);
+    doc.text(today, pageW / 2 + 8, signBase + 14);
+  },
+
+  buildActaPdfDocument(signers) {
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({ unit: 'mm', format: 'letter', orientation: 'landscape' });
+    UI.renderReceiptActaPdf(doc, signers);
+    return doc;
+  },
+
+  async buildActaExcelWorkbook(signers) {
+    const meta = AppState.orderMetadata;
+    const rows = UI.buildReceiptActaRows();
+    const receivedCount = rows.filter(r => r.received).length;
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet('Inventory');
+    ws.mergeCells('I2:O2');
+    ws.getCell('I2').value = 'Receipt of Equipment Containing Data';
+    ws.getCell('I2').font = { bold: true, size: 14 };
+    ws.getCell('I2').alignment = { horizontal: 'center' };
+
+    ws.getCell('B6').value = 'Customer: ';
+    ws.getCell('D6').value = meta.customer || '';
+    ws.getCell('F6').value = 'Pickup Date:';
+    ws.getCell('I6').value = meta.pickupDate || '';
+
+    ws.getCell('B7').value = 'Company Name: ';
+    ws.getCell('D7').value = 'XS International';
+    ws.getCell('F7').value = 'Project ID:';
+    ws.getCell('I7').value = meta.poReference || meta.project || '';
+
+    ws.getCell('B8').value = 'Collection Address:';
+    ws.getCell('D8').value = meta.address || '';
+    if (meta.clientProjectOrder) {
+      ws.getCell('B9').value = 'Project Order:';
+      ws.getCell('D9').value = meta.clientProjectOrder;
+    }
+
+    const headRow = meta.clientProjectOrder ? 11 : 10;
+    ['B', 'C', 'D', 'E', 'F', 'G', 'I', 'J'].forEach(col => {
+      const labels = {
+        B: 'Item ', C: 'Product', D: 'Make', E: 'Model', F: 'Serial Number',
+        G: 'Equipment Containing Data               (  Y       /      N  )',
+        I: 'Recibido (Sí/No)', J: 'Notes'
+      };
+      const cell = ws.getCell(`${col}${headRow}`);
+      cell.value = labels[col];
+      cell.font = { bold: true };
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFECECEC' } };
+    });
+
+    let r = headRow + 1;
+    rows.forEach(row => {
+      ws.getCell(`B${r}`).value = row.itemNo;
+      ws.getCell(`C${r}`).value = row.product;
+      ws.getCell(`D${r}`).value = row.make;
+      ws.getCell(`E${r}`).value = row.model;
+      ws.getCell(`F${r}`).value = row.serial;
+      ws.getCell(`G${r}`).value = row.received ? 'Y' : 'N';
+      ws.getCell(`I${r}`).value = row.receivedLabel;
+      ws.getCell(`J${r}`).value = row.notes;
+      ws.getCell(`I${r}`).font = { color: { argb: row.received ? 'FF006600' : 'FFAA0000' } };
+      r += 1;
+    });
+    r += 1;
+    ws.getCell(`B${r}`).value = 'TOTAL ITEMS:';
+    ws.getCell(`D${r}`).value = rows.length;
+    ws.getCell(`F${r}`).value = `Recibidos: ${receivedCount}`;
+    ws.getCell(`I${r}`).value = `Pendientes: ${rows.length - receivedCount}`;
+
+    const signLabelRow = r + 5;
+    const signImageRow = signLabelRow + 1;
+    const signMetaRow = signImageRow + 4;
+    ws.getCell(`B${signLabelRow}`).value = 'XSi Representative Signature';
+    ws.getCell(`F${signLabelRow}`).value = 'Customer Signature ';
+    ws.getRow(signImageRow).height = 52;
+    ws.getRow(signImageRow + 1).height = 52;
+
+    const xsiB64 = UI.signaturePngBase64(AppState.signerXsi.signature);
+    const clientB64 = UI.signaturePngBase64(AppState.signerClient.signature);
+    if (xsiB64) {
+      const imgId = wb.addImage({ base64: xsiB64, extension: 'png' });
+      ws.addImage(imgId, {
+        tl: { col: 1.2, row: signImageRow - 0.15 },
+        ext: { width: 210, height: 58 }
+      });
+    }
+    if (clientB64) {
+      const imgId = wb.addImage({ base64: clientB64, extension: 'png' });
+      ws.addImage(imgId, {
+        tl: { col: 5.2, row: signImageRow - 0.15 },
+        ext: { width: 210, height: 58 }
+      });
+    }
+
+    const today = new Date().toLocaleDateString('es-GT');
+    ws.getCell(`B${signMetaRow}`).value = `${signers.xsiName} · DPI ${signers.xsiDpi || '—'} · ${today}`;
+    ws.getCell(`F${signMetaRow}`).value = `${signers.clientName} · DPI ${signers.clientDpi || '—'} · ${today}`;
+    if (signers.notes) {
+      ws.getCell(`B${signMetaRow + 2}`).value = `Observaciones: ${signers.notes}`;
+    }
+
+    ws.columns = [
+      { width: 4 }, { width: 6 }, { width: 12 }, { width: 14 }, { width: 22 },
+      { width: 16 }, { width: 14 }, { width: 4 }, { width: 12 }, { width: 28 }
+    ];
+    return wb;
+  },
+
+  renderActaDeployPanel(deploy) {
+    const panel = document.getElementById('actaDeployPanel');
+    if (!panel) return;
+    const data = deploy || AppState.workflow.actaDeploy;
+    if (!data?.pdf?.filename) {
+      panel.classList.add('hidden');
+      panel.innerHTML = '';
+      return;
+    }
+    const cloudNote = data.pdf.isLocalFallback
+      ? '<p style="font-size:11px;color:var(--text-muted);margin:8px 0 0;">Sin Supabase: archivos solo en este dispositivo (descarga local).</p>'
+      : '<p style="font-size:11px;color:var(--text-muted);margin:8px 0 0;">Publicado en bucket ITAD — enlaces listos para cliente.</p>';
+    const link = (label, ref) => {
+      if (!ref?.publicUrl) return '';
+      return `<a href="${ref.publicUrl}" target="_blank" rel="noopener">${label}: ${ref.filename}</a>`;
+    };
+    panel.innerHTML = `
+      <h4>Acta firmada desplegada</h4>
+      <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;">
+        Entregada ${new Date(data.at).toLocaleString('es-GT')} · ${data.signers?.clientName || ''} / ${data.signers?.xsiName || ''}
+      </div>
+      <div class="acta-deploy-links">
+        ${link('📄 PDF firmado', data.pdf)}
+        ${link('📊 Excel firmado', data.xlsx)}
+      </div>
+      ${cloudNote}
+    `;
+    panel.classList.remove('hidden');
+    panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  },
+
+  async deliverSignedActa(opts = {}) {
+    const signers = UI.validateActaReady();
+    if (!signers) return;
+    if (typeof window.jspdf === 'undefined' || typeof ExcelJS === 'undefined') {
+      UIFeedback.toast('jsPDF o ExcelJS no cargó. Revise internet y recargue.', 'danger');
       return;
     }
 
-    const { jsPDF } = window.jspdf;
-    const doc = new jsPDF({ unit: 'mm', format: 'letter' });
-    const meta = AppState.orderMetadata;
-    let y = 18;
-    doc.setFontSize(14);
-    doc.text('ACTA DE RECEPCIÓN Y CUSTODIA — ITAD CORE', 14, y);
-    y += 8;
-    doc.setFontSize(10);
-    doc.text(`Cliente: ${meta.customer}`, 14, y); y += 5;
-    doc.text(`Proyecto: ${meta.project}`, 14, y); y += 5;
-    doc.text(`Fecha: ${meta.pickupDate}`, 14, y); y += 5;
-    doc.text(`Representante: ${clientName}`, 14, y); y += 5;
-    doc.text(`DPI cliente: ${document.getElementById('signerClientDpi').value || '—'}`, 14, y); y += 5;
-    const xsiName = document.getElementById('signerXsiName').value.trim() || '—';
-    doc.text(`Técnico XSI: ${xsiName}`, 14, y); y += 5;
-    doc.text(`DPI técnico: ${document.getElementById('signerXsiDpi').value || '—'}`, 14, y); y += 8;
-    doc.text(`Equipos recibidos: ${received.length} de ${AppState.items.length}`, 14, y); y += 6;
+    const pdfName = UI.actaBaseFilename('pdf');
+    const xlsxName = UI.actaBaseFilename('xlsx');
+    UIFeedback.toast('Generando acta firmada PDF + Excel…', 'info');
 
-    received.slice(0, 35).forEach((item, idx) => {
-      if (y > 260) { doc.addPage(); y = 18; }
-      doc.text(`${idx + 1}. ${item.serial.raw} — ${item.make} ${item.model}`, 14, y);
-      y += 5;
+    const doc = UI.buildActaPdfDocument(signers);
+    const pdfBlob = doc.output('blob');
+    const pdfBuf = await pdfBlob.arrayBuffer();
+    const wb = await UI.buildActaExcelWorkbook(signers);
+    const xlsxBuf = await wb.xlsx.writeBuffer();
+    const xlsxBlob = new Blob([xlsxBuf], {
+      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
     });
-    if (received.length > 35) {
-      doc.text(`… y ${received.length - 35} equipos más (ver sistema ITAD).`, 14, y);
-      y += 5;
+
+    let pdfRef = { filename: pdfName, publicUrl: URL.createObjectURL(pdfBlob), isLocalFallback: true };
+    let xlsxRef = { filename: xlsxName, publicUrl: URL.createObjectURL(xlsxBlob), isLocalFallback: true };
+
+    try {
+      pdfRef = { ...pdfRef, ...(await AppState.storage.uploadActa(pdfBuf, pdfName, 'application/pdf')) };
+      xlsxRef = {
+        ...xlsxRef,
+        ...(await AppState.storage.uploadActa(xlsxBuf, xlsxName,
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'))
+      };
+    } catch (err) {
+      UIFeedback.toast('Nube: ' + (err.message || err) + ' — se guarda solo local', 'warning');
     }
 
-    const notes = document.getElementById('receptionNotes').value.trim();
-    if (notes) { doc.text(`Observaciones: ${notes}`, 14, y + 4); y += 10; }
+    const deploy = {
+      at: new Date().toISOString(),
+      signers: { ...signers },
+      pdf: { filename: pdfName, ...pdfRef },
+      xlsx: { filename: xlsxName, ...xlsxRef }
+    };
+    AppState.workflow.actaDeploy = deploy;
+    AppState.orderMetadata.actaDeploy = deploy;
+    OrderStore.persistActive();
+    scheduleSupabaseLabSync();
 
-    if (y > 220) { doc.addPage(); y = 18; }
-
-    if (AppState.signerClient.signature) {
-      doc.addImage(AppState.signerClient.signature, 'PNG', 14, y + 2, 70, 25);
-      doc.text('Firma representante cliente', 14, y + 30);
-    }
-    if (AppState.signerXsi.signature) {
-      doc.addImage(AppState.signerXsi.signature, 'PNG', 110, y + 2, 70, 25);
-      doc.text('Firma técnico XSI', 110, y + 30);
-    }
-    if (AppState.signerClient.signature || AppState.signerXsi.signature) {
-      y += 36;
+    if (!opts.shareOnly) {
+      UI.downloadBlob(pdfBlob, pdfName);
+      UI.downloadBlob(xlsxBlob, xlsxName);
     }
 
-    const filename = `acta-recepcion-${Date.now()}.pdf`;
-    if (shareViaOs && navigator.share) {
-      const blob = doc.output('blob');
+    UI.renderActaDeployPanel(deploy);
+
+    if (opts.shareOnly && navigator.share) {
       try {
-        await navigator.share({ files: [new File([blob], filename, { type: 'application/pdf' })], title: 'Acta ITAD' });
+        await navigator.share({
+          files: [
+            new File([pdfBlob], pdfName, { type: 'application/pdf' }),
+            new File([xlsxBlob], xlsxName, {
+              type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            })
+          ],
+          title: 'Acta ITAD firmada'
+        });
+        UIFeedback.toast('Acta compartida (PDF + Excel)', 'success');
         return;
-      } catch (e) { /* fallback download */ }
+      } catch (_) { /* fallback */ }
     }
-    doc.save(filename);
-    UIFeedback.toast('Acta PDF generada', 'success');
+
+    UIFeedback.toast(
+      opts.shareOnly
+        ? 'Acta desplegada — use los enlaces del panel'
+        : 'Acta firmada entregada: descarga local + panel desplegado',
+      'success'
+    );
   }
 };
 
